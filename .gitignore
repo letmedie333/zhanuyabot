@@ -1,0 +1,7 @@
+.env
+complaints.db
+bot.log
+ngrok.exe
+media_files/
+__pycache__/
+*.pyc
