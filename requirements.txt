@@ -1,0 +1,5 @@
+flask
+pandas
+xlsxwriter
+gunicorn
+green-api-sdk
