@@ -1,9 +1,9 @@
 import os
 import time
 import uuid
-import sqlite3
 import logging
 import requests
+import psycopg2
 from PIL import Image
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
@@ -29,9 +29,10 @@ ID_INSTANCE = os.getenv("GREEN_API_ID")
 API_TOKEN_INSTANCE = os.getenv("GREEN_API_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE", "77000000000")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not all([ID_INSTANCE, API_TOKEN_INSTANCE, WEBHOOK_SECRET]):
-    logging.critical("❌ Ошибка: Отсутствуют критические переменные окружения в .env!")
+if not all([ID_INSTANCE, API_TOKEN_INSTANCE, WEBHOOK_SECRET, DATABASE_URL]):
+    logging.critical("❌ Ошибка: Отсутствуют критические переменные окружения в .env (включая DATABASE_URL)!")
     raise ValueError("Критическая ошибка конфигурации.")
 
 # Лимит обращений в день установлен на 5
@@ -39,17 +40,10 @@ MAX_DAILY_LIMIT = 5
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_TEXT_LENGTH = 3000
 
-# Расширенный список разрешенных форматов (включая все варианты голосовых сообщений)
+# Расширенный список разрешенных форматов
 ALLOWED_MIME_TYPES = [
-    'image/jpeg', 
-    'image/png', 
-    'audio/ogg', 
-    'audio/aac', 
-    'audio/mp4', 
-    'audio/amr', 
-    'audio/mpeg', 
-    'application/ogg', 
-    'video/mp4'
+    'image/jpeg', 'image/png', 'audio/ogg', 'audio/aac', 
+    'audio/mp4', 'audio/amr', 'audio/mpeg', 'application/ogg', 'video/mp4'
 ]
 
 greenAPI = API.GreenApi(ID_INSTANCE, API_TOKEN_INSTANCE)
@@ -60,63 +54,68 @@ executor = ThreadPoolExecutor(max_workers=5)
 # 2. ИНИЦИАЛИЗАЦИЯ БД И АРХИТЕКТУРА
 # ==========================================
 MEDIA_FOLDER = "media_files"
-DB_NAME = "complaints.db"
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
-def init_db():
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        with conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS complaints (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    phone TEXT,
-                    language TEXT,
-                    address TEXT,
-                    category TEXT,
-                    text_message TEXT,
-                    media_path TEXT,
-                    status TEXT DEFAULT 'new',
-                    priority TEXT DEFAULT 'medium',
-                    tags TEXT DEFAULT '',
-                    assigned_to TEXT,
-                    created_at TIMESTAMP,
-                    response_at TIMESTAMP,
-                    updated_at TIMESTAMP,
-                    closed_at TIMESTAMP
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS complaint_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    complaint_id INTEGER,
-                    changed_by TEXT,
-                    action TEXT,
-                    old_value TEXT,
-                    new_value TEXT,
-                    changed_at TIMESTAMP
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS user_sessions (
-                    phone TEXT PRIMARY KEY,
-                    step TEXT,
-                    lang TEXT,
-                    address TEXT,
-                    category TEXT,
-                    updated_at TIMESTAMP
-                )
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS processed_messages (
-                    message_id TEXT PRIMARY KEY,
-                    processed_at TIMESTAMP
-                )
-            ''')
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_phone ON complaints(phone);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON complaints(status);")
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
 
-init_db()
+def init_db():
+    with closing(get_db_connection()) as conn:
+        with conn:  # Авто-коммит
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS complaints (
+                        id SERIAL PRIMARY KEY,
+                        phone TEXT,
+                        language TEXT,
+                        address TEXT,
+                        category TEXT,
+                        text_message TEXT,
+                        media_path TEXT,
+                        status TEXT DEFAULT 'new',
+                        priority TEXT DEFAULT 'medium',
+                        tags TEXT DEFAULT '',
+                        assigned_to TEXT,
+                        created_at TIMESTAMP,
+                        response_at TIMESTAMP,
+                        updated_at TIMESTAMP,
+                        closed_at TIMESTAMP
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS complaint_history (
+                        id SERIAL PRIMARY KEY,
+                        complaint_id INTEGER,
+                        changed_by TEXT,
+                        action TEXT,
+                        old_value TEXT,
+                        new_value TEXT,
+                        changed_at TIMESTAMP
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_sessions (
+                        phone TEXT PRIMARY KEY,
+                        step TEXT,
+                        lang TEXT,
+                        address TEXT,
+                        category TEXT,
+                        updated_at TIMESTAMP
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS processed_messages (
+                        message_id TEXT PRIMARY KEY,
+                        processed_at TIMESTAMP
+                    )
+                ''')
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_phone ON complaints(phone);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON complaints(status);")
+
+try:
+    init_db()
+except Exception as e:
+    logging.error(f"Ошибка инициализации таблиц бота: {e}")
 
 # ==========================================
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ДАННЫЕ
@@ -137,66 +136,79 @@ def safe_send(chat_id, text, req_id):
         logging.error(f"[{req_id}] Ошибка сети при отправке: {e}")
 
 def is_new_message(message_id):
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
+    with closing(get_db_connection()) as conn:
         with conn:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO processed_messages (message_id, processed_at) VALUES (?, ?)",
-                (message_id, datetime.now(KZ_TZ).strftime('%Y-%m-%d %H:%M:%S'))
-            )
-            return cursor.rowcount > 0
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO processed_messages (message_id, processed_at) VALUES (%s, %s) ON CONFLICT (message_id) DO NOTHING",
+                    (message_id, datetime.now(KZ_TZ).strftime('%Y-%m-%d %H:%M:%S'))
+                )
+                return cursor.rowcount > 0
 
 def is_duplicate_complaint(phone, text):
     if not text: return False
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
-        time_limit = (datetime.now(KZ_TZ) - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-        res = conn.execute(
-            "SELECT text_message FROM complaints WHERE phone = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
-            (phone, time_limit)
-        ).fetchone()
-        return res and res[0] == text
+    with closing(get_db_connection()) as conn:
+        with conn.cursor() as cursor:
+            time_limit = (datetime.now(KZ_TZ) - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute(
+                "SELECT text_message FROM complaints WHERE phone = %s AND created_at >= %s ORDER BY created_at DESC LIMIT 1",
+                (phone, time_limit)
+            )
+            res = cursor.fetchone()
+            return res and res[0] == text
 
 def get_session(phone):
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
-        res = conn.execute("SELECT step, lang, address, category, updated_at FROM user_sessions WHERE phone = ?", (phone,)).fetchone()
-        if res:
-            updated_at = datetime.strptime(res[4], '%Y-%m-%d %H:%M:%S')
-            updated_at = updated_at.replace(tzinfo=KZ_TZ)
-            
-            if datetime.now(KZ_TZ) - updated_at > timedelta(hours=24):
-                conn.execute("DELETE FROM user_sessions WHERE phone = ?", (phone,))
-                conn.commit()
-                return None
-            return {'step': res[0], 'lang': res[1], 'address': res[2], 'category': res[3]}
+    with closing(get_db_connection()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT step, lang, address, category, updated_at FROM user_sessions WHERE phone = %s", (phone,))
+            res = cursor.fetchone()
+            if res:
+                updated_at = res[4]
+                # В PostgreSQL это уже объект datetime, но на всякий случай проверяем
+                if isinstance(updated_at, str):
+                    updated_at = datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
+                
+                updated_at = updated_at.replace(tzinfo=KZ_TZ) if updated_at.tzinfo is None else updated_at
+                
+                if datetime.now(KZ_TZ) - updated_at > timedelta(hours=24):
+                    with conn:
+                        cursor.execute("DELETE FROM user_sessions WHERE phone = %s", (phone,))
+                    return None
+                return {'step': res[0], 'lang': res[1], 'address': res[2], 'category': res[3]}
         return None
 
 def update_session(phone, step, lang=None, address=None, category=None):
     now = datetime.now(KZ_TZ).strftime('%Y-%m-%d %H:%M:%S')
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
+    with closing(get_db_connection()) as conn:
         with conn:
-            conn.execute("""
-                INSERT INTO user_sessions (phone, step, lang, address, category, updated_at) 
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(phone) DO UPDATE SET 
-                    step=excluded.step, 
-                    lang=COALESCE(excluded.lang, user_sessions.lang), 
-                    address=COALESCE(excluded.address, user_sessions.address),
-                    category=COALESCE(excluded.category, user_sessions.category),
-                    updated_at=excluded.updated_at
-            """, (phone, step, lang, address, category, now))
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO user_sessions (phone, step, lang, address, category, updated_at) 
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (phone) DO UPDATE SET 
+                        step=EXCLUDED.step, 
+                        lang=COALESCE(EXCLUDED.lang, user_sessions.lang), 
+                        address=COALESCE(EXCLUDED.address, user_sessions.address),
+                        category=COALESCE(EXCLUDED.category, user_sessions.category),
+                        updated_at=EXCLUDED.updated_at
+                """, (phone, step, lang, address, category, now))
 
 def clear_session(phone):
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
+    with closing(get_db_connection()) as conn:
         with conn:
-            conn.execute("DELETE FROM user_sessions WHERE phone = ?", (phone,))
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_sessions WHERE phone = %s", (phone,))
 
 def get_daily_complaint_count(phone_number):
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
-        today_str = datetime.now(KZ_TZ).strftime('%Y-%m-%d')
-        res = conn.execute(
-            "SELECT COUNT(*) FROM complaints WHERE phone = ? AND strftime('%Y-%m-%d', created_at) = ?",
-            (phone_number, today_str)
-        ).fetchone()
-        return res[0] if res else 0
+    with closing(get_db_connection()) as conn:
+        with conn.cursor() as cursor:
+            today_str = datetime.now(KZ_TZ).strftime('%Y-%m-%d')
+            cursor.execute(
+                "SELECT COUNT(*) FROM complaints WHERE phone = %s AND DATE(created_at) = %s",
+                (phone_number, today_str)
+            )
+            res = cursor.fetchone()
+            return res[0] if res else 0
 
 # Обновленные списки
 ADDRESSES = {
@@ -321,7 +333,7 @@ def process_message(body, req_id):
                             safe_send(chat_id, "Ошибка загрузки файла.", req_id)
                             return
                             
-                        # ИСПРАВЛЕНИЕ: Очищаем content_type от кодеков и прочего мусора
+                        # Очищаем content_type от кодеков и прочего мусора
                         raw_content_type = res.headers.get('Content-Type', '')
                         content_type = raw_content_type.split(';')[0].strip().lower()
                         
@@ -367,19 +379,22 @@ def process_message(body, req_id):
                 safe_send(chat_id, "Отправьте текст или фото/аудио.", req_id)
                 return
 
-            with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
+            with closing(get_db_connection()) as conn:
                 with conn:
-                    now = datetime.now(KZ_TZ).strftime('%Y-%m-%d %H:%M:%S')
-                    cursor = conn.execute(
-                        "INSERT INTO complaints (phone, language, address, category, text_message, media_path, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)",
-                        (phone_number, lang, address, category, complaint_text, local_media_path, priority, now, now)
-                    )
-                    complaint_id = cursor.lastrowid
-                    
-                    conn.execute(
-                        "INSERT INTO complaint_history (complaint_id, changed_by, action, old_value, new_value, changed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (complaint_id, 'system', 'created', '', 'new', now)
-                    )
+                    with conn.cursor() as cursor:
+                        now = datetime.now(KZ_TZ).strftime('%Y-%m-%d %H:%M:%S')
+                        # Запись жалобы и получение её ID
+                        cursor.execute(
+                            "INSERT INTO complaints (phone, language, address, category, text_message, media_path, status, priority, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, 'new', %s, %s, %s) RETURNING id",
+                            (phone_number, lang, address, category, complaint_text, local_media_path, priority, now, now)
+                        )
+                        complaint_id = cursor.fetchone()[0]
+                        
+                        # Запись в историю
+                        cursor.execute(
+                            "INSERT INTO complaint_history (complaint_id, changed_by, action, old_value, new_value, changed_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                            (complaint_id, 'system', 'created', '', 'new', now)
+                        )
                     
             clear_session(phone_number)
             
@@ -417,5 +432,6 @@ def receive_webhook(secret):
     return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
-    logging.info("🚀 Бот запущен (Friendly & Fixed Mode)")
-    serve(app, host='0.0.0.0', port=8000, threads=5, connection_limit=500)
+    logging.info("🚀 Бот запущен (PostgreSQL Mode)")
+    port = int(os.environ.get("PORT", 8000))
+    serve(app, host='0.0.0.0', port=port, threads=5, connection_limit=500)
