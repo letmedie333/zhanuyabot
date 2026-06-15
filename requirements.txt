@@ -2,4 +2,4 @@ flask
 pandas
 xlsxwriter
 gunicorn
-green-api-sdk
+green-api-sdk @ git+https://github.com/green-api/whatsapp-api-client-python.git
