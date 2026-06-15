@@ -3,15 +3,38 @@ import pandas as pd
 from flask import Flask, render_template_string, request, redirect, url_for, send_file
 from io import BytesIO
 from flask import send_from_directory
-# Добавь эти импорты к существующим
 import os
 from dotenv import load_dotenv
 from waitress import serve
 from flask import Response
+import traceback  # Добавлено для отслеживания ошибок
 
 app = Flask(__name__)
 DB_NAME = "complaints.db"
 
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (ФИКС ОШИБКИ 500) ---
+def init_db():
+    """Создает таблицу, если её нет. Защищает от ошибки 500 на чистом сервере Render."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS complaints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT,
+            address TEXT,
+            category TEXT,
+            text_message TEXT,
+            media_path TEXT,
+            status TEXT DEFAULT 'new',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Запускаем проверку базы при старте
+init_db()
+# ---------------------------------------------------
 
 # --- БЛОК БЕЗОПАСНОСТИ ---
 load_dotenv()
@@ -473,6 +496,22 @@ HTML_TEMPLATE = """
 """
 
 # ==========================================
+# ПЕРЕХВАТЧИК ОШИБОК 500
+# ==========================================
+@app.errorhandler(500)
+def internal_server_error(e):
+    """Отлавливает все ошибки на сервере и выводит их на экран вместо 'Белого экрана смерти'."""
+    error_trace = traceback.format_exc()
+    print("CRITICAL ERROR:", error_trace)  # Пишет в логи Render
+    return f"""
+    <div style="padding: 40px; font-family: sans-serif; max-width: 800px; margin: auto;">
+        <h1 style="color: #dc2626;">Произошла ошибка 500 😱</h1>
+        <p>Сервер столкнулся с внутренней ошибкой. Передай этот текст разработчику:</p>
+        <pre style="background: #f1f5f9; padding: 20px; border-radius: 8px; overflow-x: auto; font-size: 14px;">{error_trace}</pre>
+    </div>
+    """, 500
+
+# ==========================================
 # МАРШРУТЫ (РОУТЫ) ПРИЛОЖЕНИЯ
 # ==========================================
 @app.route('/view_media/<int:c_id>')
@@ -619,4 +658,5 @@ if __name__ == '__main__':
     print("🌐 CRM система Жанұя запущена (ЗАЩИЩЕННЫЙ РЕЖИМ)!")
     print("👉 Локальная ссылка: http://127.0.0.1:5000")
     # Используем waitress для продакшена вместо встроенного сервера Flask
-    serve(app, host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    serve(app, host='0.0.0.0', port=port)
