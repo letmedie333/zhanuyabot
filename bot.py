@@ -22,7 +22,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log", encoding='utf-8'), logging.StreamHandler()]
 )
 
-# Создаем зону Казахстана (UTC+5)
 KZ_TZ = timezone(timedelta(hours=5))
 load_dotenv()
 ID_INSTANCE = os.getenv("GREEN_API_ID")
@@ -34,23 +33,22 @@ if not all([ID_INSTANCE, API_TOKEN_INSTANCE, WEBHOOK_SECRET]):
     logging.critical("❌ Ошибка: Отсутствуют критические переменные окружения в .env!")
     raise ValueError("Критическая ошибка конфигурации.")
 
-# Лимит обращений в день установлен на 5
 MAX_DAILY_LIMIT = 5
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_TEXT_LENGTH = 3000
 
-# Расширенный список разрешенных форматов (включая все варианты голосовых сообщений)
-ALLOWED_MIME_TYPES = [
-    'image/jpeg', 
-    'image/png', 
-    'audio/ogg', 
-    'audio/aac', 
-    'audio/mp4', 
-    'audio/amr', 
-    'audio/mpeg', 
-    'application/ogg', 
-    'video/mp4'
-]
+# Жесткая привязка MIME-типов к безопасным расширениям
+ALLOWED_MIME_TYPES = {
+    'image/jpeg': 'jpg', 
+    'image/png': 'png', 
+    'audio/ogg': 'ogg', 
+    'audio/aac': 'aac', 
+    'audio/mp4': 'm4a', 
+    'audio/amr': 'amr', 
+    'audio/mpeg': 'mp3', 
+    'application/ogg': 'ogg', 
+    'video/mp4': 'mp4'
+}
 
 greenAPI = API.GreenApi(ID_INSTANCE, API_TOKEN_INSTANCE)
 app = Flask(__name__)
@@ -64,7 +62,7 @@ DB_NAME = "complaints.db"
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
 
 def init_db():
-    with closing(sqlite3.connect(DB_NAME, timeout=15)) as conn:
+    with closing(sqlite3.connect(DB_NAME, timeout=20)) as conn: # Увеличен таймаут для многопоточности
         conn.execute("PRAGMA journal_mode=WAL;")
         with conn:
             conn.execute('''
@@ -198,7 +196,12 @@ def get_daily_complaint_count(phone_number):
         ).fetchone()
         return res[0] if res else 0
 
-# Обновленные списки
+def extract_number(text):
+    """Помогает вытащить цифру, если пользователь ввел '1.' или '1 маркет'"""
+    import re
+    match = re.search(r'\d+', text)
+    return match.group(0) if match else text
+
 ADDRESSES = {
     '1': 'г.Жезказган, Алашахана 34', '2': 'г.Жезказган, Анаркулова 9',
     '3': 'г.Жезказган, Ауэзова 56', '4': 'г.Жезказган, Женис 11',
@@ -220,7 +223,6 @@ def process_message(body, req_id):
         
         message_id = body.get('idMessage')
         if not message_id or not is_new_message(message_id):
-            logging.info(f"[{req_id}] Сообщение {message_id} уже обработано. Игнорируем.")
             return
 
         msg_data = body.get('messageData', {})
@@ -230,13 +232,12 @@ def process_message(body, req_id):
         phone_number = chat_id.replace('@c.us', '')
         msg_type = msg_data.get('typeMessage', '')
         
-        # Чтение текста
+        # Безопасное чтение текста (or "" защищает от падения, если придет None)
         text = ""
         if msg_type == 'textMessage':
-            text = msg_data.get('textMessageData', {}).get('textMessage', '')
+            text = (msg_data.get('textMessageData', {}).get('textMessage') or "").strip()
         elif msg_type == 'extendedTextMessage':
-            text = msg_data.get('extendedTextMessageData', {}).get('text', '')
-        text = text.strip()
+            text = (msg_data.get('extendedTextMessageData', {}).get('text') or "").strip()
         
         is_text_msg = msg_type in ['textMessage', 'extendedTextMessage']
 
@@ -263,10 +264,11 @@ def process_message(body, req_id):
             return
 
         step, lang = session['step'], session['lang']
+        clean_text = extract_number(text) if is_text_msg else ""
 
         if step == 'CHOOSE_LANGUAGE':
-            if is_text_msg and text in ['1', '2']:
-                new_lang = 'kz' if text == '1' else 'ru'
+            if is_text_msg and clean_text in ['1', '2']:
+                new_lang = 'kz' if clean_text == '1' else 'ru'
                 update_session(phone_number, step='CHOOSE_ADDRESS', lang=new_lang)
                 address_list = "\n".join([f"📍 {k}. {v}" for k, v in ADDRESSES.items()])
                 msg = f"Қай маркет бойынша хабарласып отырсыз? Нөмірді таңдаңыз:\n\n{address_list}" if new_lang == 'kz' else f"По какому маркету вы обращаетесь? Выберите номер:\n\n{address_list}"
@@ -275,16 +277,16 @@ def process_message(body, req_id):
                 safe_send(chat_id, "1 - Қазақша / 2 - Русский", req_id)
 
         elif step == 'CHOOSE_ADDRESS':
-            if is_text_msg and text in ADDRESSES:
-                update_session(phone_number, step='CHOOSE_CATEGORY', address=ADDRESSES[text])
+            if is_text_msg and clean_text in ADDRESSES:
+                update_session(phone_number, step='CHOOSE_CATEGORY', address=ADDRESSES[clean_text])
                 msg = "Қабылдаймыз:\n1 - Шағым (Жалоба)\n2 - Ұсыныс (Предложение)" if lang == 'kz' else "Выберите категорию:\n1 - Жалоба\n2 - Предложение"
                 safe_send(chat_id, msg, req_id)
             else:
                 safe_send(chat_id, "Мекенжайды тізімнен таңдаңыз (1-16)." if lang == 'kz' else "Выберите адрес из списка (1-16).", req_id)
 
         elif step == 'CHOOSE_CATEGORY':
-            if is_text_msg and text in CATEGORIES:
-                update_session(phone_number, step='WAITING_FOR_FEEDBACK', category=CATEGORIES[text])
+            if is_text_msg and clean_text in CATEGORIES:
+                update_session(phone_number, step='WAITING_FOR_FEEDBACK', category=CATEGORIES[clean_text])
                 msg = "Жақсы. Енді хабарламаңызды жазыңыз (мәтін немесе фото жіберуге болады)." if lang == 'kz' else "Отлично. Напишите ваше сообщение (можно прикрепить фото/аудио)."
                 safe_send(chat_id, msg, req_id)
             else:
@@ -311,7 +313,7 @@ def process_message(body, req_id):
 
             if 'fileMessageData' in msg_data or msg_type in ['imageMessage', 'audioMessage', 'videoMessage']:
                 file_data = msg_data.get('fileMessageData', msg_data.get(f"{msg_type}Data", {}))
-                complaint_text = file_data.get('caption', '')
+                complaint_text = file_data.get('caption', '') or complaint_text
                 download_url = file_data.get('downloadUrl')
                 
                 if download_url:
@@ -321,7 +323,6 @@ def process_message(body, req_id):
                             safe_send(chat_id, "Ошибка загрузки файла.", req_id)
                             return
                             
-                        # ИСПРАВЛЕНИЕ: Очищаем content_type от кодеков и прочего мусора
                         raw_content_type = res.headers.get('Content-Type', '')
                         content_type = raw_content_type.split(';')[0].strip().lower()
                         
@@ -334,8 +335,10 @@ def process_message(body, req_id):
                             safe_send(chat_id, "Файл слишком большой.", req_id)
                             return
 
-                        ext = content_type.split('/')[-1]
-                        filename = f"{phone_number}_{int(time.time())}.{ext}"
+                        # Защита от коллизий и безопасное расширение
+                        ext = ALLOWED_MIME_TYPES[content_type]
+                        unique_id = uuid.uuid4().hex[:8]
+                        filename = f"{phone_number}_{unique_id}.{ext}"
                         local_media_path = os.path.join(MEDIA_FOLDER, filename)
                         
                         downloaded_size = 0
@@ -382,7 +385,6 @@ def process_message(body, req_id):
                     )
                     
             clear_session(phone_number)
-            
             current_count = get_daily_complaint_count(phone_number)
             
             limit_msg_kz = f"\n\n📊 Бүгінгі өтініштер: {current_count}/{MAX_DAILY_LIMIT}\n🏢 «Жанұя» маркеттер желісі"
@@ -395,7 +397,6 @@ def process_message(body, req_id):
                 f"✅ Спасибо! Ваше обращение принято. Мы обязательно его рассмотрим!{limit_msg_ru}\n\n"
                 "🔄 Для нового обращения отправьте любое сообщение."
             )
-            
             safe_send(chat_id, reply, req_id)
 
     except Exception as e:
@@ -417,5 +418,6 @@ def receive_webhook(secret):
     return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
-    logging.info("🚀 Бот запущен (Friendly & Fixed Mode)")
-    serve(app, host='0.0.0.0', port=8000, threads=5, connection_limit=500)
+    logging.info("🚀 Бот запущен (Secure SQLite Mode)")
+    port = int(os.environ.get("PORT", 8000))
+    serve(app, host='0.0.0.0', port=port, threads=5, connection_limit=500)
