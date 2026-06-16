@@ -6,43 +6,48 @@ import os
 from dotenv import load_dotenv
 from waitress import serve
 import traceback
-import psycopg2
-import psycopg2.extras
+import sqlite3
+from datetime import datetime
 from sqlalchemy import create_engine
 
 app = Flask(__name__)
 
 load_dotenv()
 
-# Настройки безопасности и БД
+# Настройки безопасности
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "fallback_secret_key_123")
 ADMIN_USERNAME = os.getenv("CRM_USER", "admin")
 ADMIN_PASSWORD = os.getenv("CRM_PASS", "12345")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ POSTGRESQL ---
+# Вычисляем точный абсолютный путь к файлу базы данных в папке проекта
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "complaints.db")
+
+# --- РАБОТА С БАЗОЙ ДАННЫХ SQLITE ---
 def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL не найден в переменных окружения!")
-    return psycopg2.connect(DATABASE_URL)
+    # timeout=15 спасает от блокировок при одновременной записи из бота и админки
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    # Позволяет обращаться к полям по именам: row['phone'] или в Jinja как row.phone
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    """Создает таблицу в PostgreSQL, если её нет."""
+    """Создает таблицу в SQLite, если её нет."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS complaints (
-            id SERIAL PRIMARY KEY,
-            phone TEXT,
-            address TEXT,
-            category TEXT,
-            text_message TEXT,
-            media_path TEXT,
-            status TEXT DEFAULT 'new',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
+    with conn:
+        conn.execute("PRAGMA journal_mode=WAL;")  # Включаем параллельный режим работы
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS complaints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT,
+                address TEXT,
+                category TEXT,
+                text_message TEXT,
+                media_path TEXT,
+                status TEXT DEFAULT 'new',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     conn.close()
 
 # Запускаем проверку базы при старте
@@ -60,11 +65,11 @@ def require_login():
         return redirect(url_for('login'))
 
 # ==========================================
-# СЛОВАРИ ПЕРЕВОДОВ И ШАБЛОНЫ (Укорочено для примера, словари остались твои)
+# СЛОВАРИ ПЕРЕВОДОВ И ШАБЛОНЫ
 # ==========================================
 TRANSLATIONS = {
     'ru': {
-        'nav_title': 'CRM | Жанұя', 'btn_export': '📥 Выгрузить Excel', 'tab_all': 'Все активные', 'tab_complaints': 'Жалобы', 'tab_suggestions': 'Предложения', 'tab_trash': 'Корзина', 'search_placeholder': 'Поиск по телефону, тексту, адресу...', 'stat_total': 'Всего активных', 'stat_new': 'Новые', 'stat_in_progress': 'В работе', 'stat_resolved': 'Решены', 'col_select': 'Выбор', 'col_date': 'Дата', 'col_phone': 'Телефон', 'col_address': 'Маркет', 'col_type': 'Тип', 'col_status': 'Статус', 'col_action': 'Действия', 'badge_complaint': 'Жалоба', 'badge_suggestion': 'Предложение', 'has_file': '📎 Файл', 'no_file': 'Нет', 'btn_trash': 'В мусор', 'btn_restore': 'Восстановить', 'btn_delete_perm': 'Удалить навсегда', 'btn_details': 'Детали', 'empty_msg': 'В этой категории пока нет обращений.', 'switch_lang_name': 'Қазақ тілі', 'switch_lang_code': 'kz', 'alert_select': 'Пожалуйста, выберите хотя бы одно обращение!', 'modal_title': 'Карточка обращения', 'modal_close': 'Закрыть', 'st_new': 'Новая', 'st_in_progress': 'В работе', 'st_under_review': 'На согласовании', 'st_resolved': 'Решена', 'st_closed': 'Закрыта', 'st_trash': 'В корзине'
+        'nav_title': 'CRM | Жанұя', 'btn_export': '📥 Выгрузить Excel', 'tab_all': 'Все active', 'tab_complaints': 'Жалобы', 'tab_suggestions': 'Предложения', 'tab_trash': 'Корзина', 'search_placeholder': 'Поиск по телефону, тексту, адресу...', 'stat_total': 'Всего активных', 'stat_new': 'Новые', 'stat_in_progress': 'В работе', 'stat_resolved': 'Решены', 'col_select': 'Выбор', 'col_date': 'Дата', 'col_phone': 'Телефон', 'col_address': 'Маркет', 'col_type': 'Тип', 'col_status': 'Статус', 'col_action': 'Действия', 'badge_complaint': 'Жалоба', 'badge_suggestion': 'Предложение', 'has_file': '📎 Файл', 'no_file': 'Нет', 'btn_trash': 'В мусор', 'btn_restore': 'Восстановить', 'btn_delete_perm': 'Удалить навсегда', 'btn_details': 'Детали', 'empty_msg': 'В этой категории пока нет обращений.', 'switch_lang_name': 'Қазақ тілі', 'switch_lang_code': 'kz', 'alert_select': 'Пожалуйста, выберите хотя бы одно обращение!', 'modal_title': 'Карточка обращения', 'modal_close': 'Закрыть', 'st_new': 'Новая', 'st_in_progress': 'В работе', 'st_under_review': 'На согласовании', 'st_resolved': 'Решена', 'st_closed': 'Закрыта', 'st_trash': 'В корзине'
     },
     'kz': {
         'nav_title': 'CRM | Жанұя', 'btn_export': '📥 Excel жүктеу', 'tab_all': 'Барлығы', 'tab_complaints': 'Шағымдар', 'tab_suggestions': 'Ұсыныстар', 'tab_trash': 'Себет', 'search_placeholder': 'Телефон, мәтін, мекенжай бойынша іздеу...', 'stat_total': 'Барлық белсенді', 'stat_new': 'Жаңа', 'stat_in_progress': 'Жұмыста', 'stat_resolved': 'Шешілді', 'col_select': 'Таңдау', 'col_date': 'Күні', 'col_phone': 'Телефон', 'col_address': 'Маркет', 'col_type': 'Түрі', 'col_status': 'Мәртебесі', 'col_action': 'Әрекет', 'badge_complaint': 'Шағым', 'badge_suggestion': 'Ұсыныс', 'has_file': '📎 Файл', 'no_file': 'Жоқ', 'btn_trash': 'Себетке', 'btn_restore': 'Қалпына келтіру', 'btn_delete_perm': 'Толығымен жою', 'btn_details': 'Толығырақ', 'empty_msg': 'Бұл санатта әзірге өтініштер жоқ.', 'switch_lang_name': 'Русский', 'switch_lang_code': 'ru', 'alert_select': 'Кем дегенде бір өтінішті таңдаңыз!', 'modal_title': 'Өтініш мәліметтері', 'modal_close': 'Жабу', 'st_new': 'Жаңа', 'st_in_progress': 'Жұмыста', 'st_under_review': 'Келісуде', 'st_resolved': 'Шешілді', 'st_closed': 'Жабық', 'st_trash': 'Себетте'
@@ -107,7 +112,6 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
-# В твой HTML_TEMPLATE я добавляю кнопку выхода. Остальное остается без изменений.
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="{{ lang }}">
@@ -297,7 +301,7 @@ HTML_TEMPLATE = """
                     </thead>
                     <tbody>
                         {% for row in complaints %}
-                        <tr class="clickable-row" onclick="handleRowClick(event, '{{ row.created_at }}', '{{ row.phone }}', '{{ row.address }}', '{{ t.badge_complaint if row.category == 'complaint' else t.badge_suggestion }}', '{{ row.text_message | replace('\n', '\\n') | escape }}', '{% if row.media_path %}/view_media/{{ row.id }}?ext={{ row.media_path.split('.')[-1] }}{% endif %}')">
+                        <tr class="clickable-row" onclick="handleRowClick(event, '{{ row.created_at.strftime('%Y-%m-%d %H:%M') if row.created_at else '' }}', '{{ row.phone }}', '{{ row.address }}', '{{ t.badge_complaint if row.category == 'complaint' else t.badge_suggestion }}', '{{ row.text_message | replace('\n', '\\n') | escape }}', '{% if row.media_path %}/view_media/{{ row.id }}?ext={{ row.media_path.split('.')[-1] }}{% endif %}')">
                             <td style="text-align: center;"><input type="checkbox" name="selected_ids" value="{{ row.id }}"></td>
                             <td style="color: #64748b; font-weight: 500;">{{ row.created_at.strftime('%Y-%m-%d %H:%M') if row.created_at else '' }}</td>
                             <td style="font-weight: 600;">{{ row.phone }}</td>
@@ -379,7 +383,6 @@ def login():
     if request.method == 'POST':
         if request.form.get('username') == ADMIN_USERNAME and request.form.get('password') == ADMIN_PASSWORD:
             session['logged_in'] = True
-            # Session will clear when browser/tab is closed
             return redirect(url_for('index'))
         else:
             error = "Неверный логин или пароль"
@@ -395,13 +398,14 @@ def logout():
 def view_media(c_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT media_path FROM complaints WHERE id = %s", (c_id,))
+    # Изменен плейсхолдер %s -> ? для SQLite
+    cursor.execute("SELECT media_path FROM complaints WHERE id = ?", (c_id,))
     row = cursor.fetchone()
     conn.close()
     
-    if row and row[0]:
+    if row and row['media_path']:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = os.path.join(base_dir, row[0])
+        full_path = os.path.join(base_dir, row['media_path'])
         directory, filename = os.path.split(full_path)
         return send_from_directory(directory, filename)
     return "Файл не найден", 404
@@ -413,21 +417,32 @@ def index():
     t = TRANSLATIONS.get(lang, TRANSLATIONS['ru'])
     
     conn = get_db_connection()
-    # Используем DictCursor, чтобы обращаться к данным по имени столбца (как row.phone)
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cursor = conn.cursor()
     
+    # Изменены плейсхолдеры %s -> ? для SQLite
     if filter_type == 'trash':
         cursor.execute("SELECT * FROM complaints WHERE status = 'trash' ORDER BY created_at DESC")
     elif filter_type in ['complaint', 'suggestion']:
-        cursor.execute("SELECT * FROM complaints WHERE status != 'trash' AND category = %s ORDER BY created_at DESC", (filter_type,))
+        cursor.execute("SELECT * FROM complaints WHERE status != 'trash' AND category = ? ORDER BY created_at DESC", (filter_type,))
     else: 
         cursor.execute("SELECT * FROM complaints WHERE status != 'trash' ORDER BY created_at DESC")
-    complaints = cursor.fetchall()
+    complaints_raw = cursor.fetchall()
     
-    # Собираем статистику (обычный курсор)
-    cursor_stats = conn.cursor()
-    cursor_stats.execute("SELECT status, count(*) FROM complaints WHERE status != 'trash' GROUP BY status")
-    stats_raw = dict(cursor_stats.fetchall())
+    # ПРЕОБРАЗОВАНИЕ ДАТ: Парсим строковые таймстампы SQLite в полноценные datetime-объекты для шаблонизатора
+    complaints = []
+    for row in complaints_raw:
+        item = dict(row)
+        if item.get('created_at'):
+            try:
+                clean_date = item['created_at'].split('.')[0] # Убираем микросекунды, если есть
+                item['created_at'] = datetime.strptime(clean_date, '%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+        complaints.append(item)
+    
+    # Собираем статистику
+    cursor.execute("SELECT status, count(*) FROM complaints WHERE status != 'trash' GROUP BY status")
+    stats_raw = dict(cursor.fetchall())
     stats = {
         'total': sum(stats_raw.values()),
         'new': stats_raw.get('new', 0),
@@ -446,10 +461,10 @@ def handle_action(c_id, action):
     cursor = conn.cursor()
 
     if action == 'delete_permanent':
-        cursor.execute("DELETE FROM complaints WHERE id = %s", (c_id,))
+        cursor.execute("DELETE FROM complaints WHERE id = ?", (c_id,))
     else:
         new_status = 'trash' if action == 'trash' else 'new'
-        cursor.execute("UPDATE complaints SET status = %s WHERE id = %s", (new_status, c_id))
+        cursor.execute("UPDATE complaints SET status = ? WHERE id = ?", (new_status, c_id))
         
     conn.commit()
     conn.close()
@@ -462,7 +477,7 @@ def update_status(c_id):
     filter_type = request.args.get('filter', 'all')
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE complaints SET status = %s WHERE id = %s", (new_status, c_id))
+    cursor.execute("UPDATE complaints SET status = ? WHERE id = ?", (new_status, c_id))
     conn.commit()
     conn.close()
     return redirect(url_for('index', lang=lang, filter=filter_type))
@@ -475,9 +490,8 @@ def export():
     if not selected_ids:
         return redirect(url_for('index', lang=lang))
         
-    # Преобразуем ID в целые числа для безопасности
     selected_ids = [int(id) for id in selected_ids]
-    placeholders = ','.join('%s' for _ in selected_ids)
+    placeholders = ','.join('?' for _ in selected_ids) # Изменено %s -> ?
     
     query = f"""
         SELECT 
@@ -493,8 +507,8 @@ def export():
         ORDER BY created_at DESC
     """
     
-    # SQLAlchemy нужен для корректной работы pandas с PostgreSQL
-    engine = create_engine(DATABASE_URL.replace('postgres://', 'postgresql://'))
+    # SQLAlchemy подключается к локальному SQLite файлу напрямую
+    engine = create_engine(f'sqlite:///{DB_PATH}')
     df = pd.read_sql_query(query, engine, params=selected_ids)
     
     status_dict = {'new': 'Новая', 'in_progress': 'В работе', 'under_review': 'На согласовании', 'resolved': 'Решена', 'closed': 'Закрыта', 'trash': 'В корзине'}
@@ -506,6 +520,10 @@ def export():
         
     if 'Категория' in df.columns:
         df['Категория'] = df['Категория'].map(category_dict)
+        
+    # Преобразуем строковые даты в формат без часовых поясов для беспроблемного сохранения в Excel
+    if 'Дата и время' in df.columns:
+        df['Дата и время'] = pd.to_datetime(df['Дата и время']).dt.strftime('%Y-%m-%d %H:%M')
     
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -515,6 +533,6 @@ def export():
     return send_file(output, as_attachment=True, download_name="Отчет_CRM.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == '__main__':
-    print("🌐 CRM система запущена!")
+    print("🌐 CRM система успешно запущена на SQLite!")
     port = int(os.environ.get("PORT", 5000))
     serve(app, host='0.0.0.0', port=port)
