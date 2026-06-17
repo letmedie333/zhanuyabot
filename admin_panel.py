@@ -15,9 +15,9 @@ app = Flask(__name__)
 load_dotenv()
 
 # Настройки безопасности
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "fallback_secret_key_123")
-ADMIN_USERNAME = os.getenv("CRM_USER", "admin")
-ADMIN_PASSWORD = os.getenv("CRM_PASS", "12345")
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+ADMIN_USERNAME = os.getenv("CRM_USER")
+ADMIN_PASSWORD = os.getenv("CRM_PASS")
 
 # Вычисляем точный абсолютный путь к файлу базы данных в папке проекта
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
